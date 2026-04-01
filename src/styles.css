@@ -1086,6 +1086,19 @@ html, body {
   font-weight: 800;
 }
 
+.board-selection-meta {
+  margin-top: 10px;
+}
+
+.board-selection-meta-line {
+  font-size: 0.9rem;
+  color: var(--text);
+}
+
+.board-selection-meta-line strong {
+  color: #81C784;
+}
+
 .prospection-actions {
   display: flex;
   flex-wrap: wrap;

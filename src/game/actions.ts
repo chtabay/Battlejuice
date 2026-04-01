@@ -1,6 +1,6 @@
 import type {
   GameState, CompanyId, RDEAction, CompanyState, BoardLayout,
-  CompanyConfig, PendingProspectionState,
+  CompanyConfig, PendingBoardSelection, HexCell,
 } from './types';
 import { COMPANIES, getLevelFromMarketValue } from './types';
 import {
@@ -42,35 +42,219 @@ export interface ActionContext {
   company: CompanyState;
   stats: BoardStats;
   modal: ActionModal;
+  /** Met en évidence des hexagones (ex. cibles Guerre des prix) ; `null` ou `[]` efface. */
+  highlightBoardKeys: (keys: string[] | null) => void;
 }
 
 export interface ActionResult {
   log: string;
-  /** Si défini, l’UI affiche le panneau prospection (pas de modale). */
-  prospectionDeferred?: PendingProspectionState;
+  /** Sélection sur le plateau (clics sur hexagones valides). */
+  boardSelectionDeferred?: PendingBoardSelection;
 }
 
-export function applyProspectionCount(state: GameState, count: number): string {
-  const pending = state.pendingProspection;
-  if (!pending) return '';
-  const { companyId, targetKeys, maxConquer } = pending;
-  const cfg = COMPANIES[companyId];
-  const n = Math.min(Math.max(0, Math.floor(count)), maxConquer, targetKeys.length);
-  const cellByKey = new Map(state.board.cells.map(c => [axialKey(c), c]));
-  let conquered = 0;
-  for (let i = 0; i < n; i++) {
-    const cell = cellByKey.get(targetKeys[i]);
-    if (!cell) continue;
-    cell.marketShareOwner = companyId;
-    cell.prospectionPawns.push(companyId);
-    conquered++;
+export function toggleBoardSelectionKey(state: GameState, key: string): boolean {
+  const p = state.pendingBoardSelection;
+  if (!p) return false;
+  const valid = new Set(p.validKeys);
+  if (!valid.has(key)) return false;
+  const i = p.selectedKeys.indexOf(key);
+  if (i >= 0) {
+    p.selectedKeys.splice(i, 1);
+  } else if (p.selectedKeys.length < p.maxSelect) {
+    p.selectedKeys.push(key);
   }
-  state.pendingProspection = null;
-  return `${cfg.label} — Prospection : ${conquered} case(s) conquise(s).`;
+  return true;
 }
 
-export function clearPendingProspection(state: GameState): void {
-  state.pendingProspection = null;
+export interface ApplyBoardSelectionResult {
+  log: string;
+  /** Enchaînement école après pions (Management). */
+  stillPending: boolean;
+}
+
+export function applyBoardSelection(state: GameState): ApplyBoardSelectionResult {
+  const p = state.pendingBoardSelection;
+  if (!p) return { log: '', stillPending: false };
+  const cfg = COMPANIES[p.companyId];
+  const cellByKey = new Map(state.board.cells.map(c => [axialKey(c), c]));
+  const valid = new Set(p.validKeys);
+
+  if (p.kind === 'prospection') {
+    let conquered = 0;
+    for (const key of p.selectedKeys) {
+      if (!valid.has(key)) continue;
+      const cell = cellByKey.get(key);
+      if (!cell) continue;
+      cell.marketShareOwner = p.companyId;
+      cell.prospectionPawns.push(p.companyId);
+      conquered++;
+    }
+    state.pendingBoardSelection = null;
+    return {
+      log: `${cfg.label} — Prospection : ${conquered} case(s) conquise(s).`,
+      stillPending: false,
+    };
+  }
+
+  if (p.kind === 'construction') {
+    const company = state.companies[p.companyId];
+    const unit = p.costPerFactory ?? FACTORY_COST;
+    let factoriesOnBoard = 0;
+    for (const c of state.board.cells) {
+      if (c.hasFactory && c.companyId === p.companyId) factoriesOnBoard++;
+    }
+    let slotsLeft = MAX_FACTORIES - factoriesOnBoard;
+    let built = 0;
+    for (const key of p.selectedKeys) {
+      if (!valid.has(key)) continue;
+      const cell = cellByKey.get(key);
+      if (!cell || cell.hasFactory) continue;
+      if (slotsLeft <= 0) break;
+      if (company.treasury < unit) break;
+      cell.hasFactory = true;
+      company.treasury -= unit;
+      built++;
+      slotsLeft--;
+    }
+    state.pendingBoardSelection = null;
+    const spent = built * unit;
+    return {
+      log: `${cfg.label} — Construction : ${built} usine(s) construite(s) (−${spent}M).`,
+      stillPending: false,
+    };
+  }
+
+  if (p.kind === 'management_pawns') {
+    return applyManagementPawns(state, p, cfg, cellByKey, valid);
+  }
+
+  if (p.kind === 'management_school') {
+    return applyManagementSchool(state, p, cfg, cellByKey, valid);
+  }
+
+  state.pendingBoardSelection = null;
+  return { log: '', stillPending: false };
+}
+
+function applyManagementPawns(
+  state: GameState,
+  p: PendingBoardSelection,
+  cfg: CompanyConfig,
+  cellByKey: Map<string, HexCell>,
+  valid: Set<string>,
+): ApplyBoardSelectionResult {
+  const mg = state.pendingManagement;
+  if (!mg || mg.companyId !== p.companyId) {
+    state.pendingBoardSelection = null;
+    state.pendingManagement = null;
+    return { log: `${cfg.label} — Management : erreur d'état.`, stillPending: false };
+  }
+
+  const key = p.selectedKeys[0];
+  if (!key || !valid.has(key)) {
+    return {
+      log: `${cfg.label} — Management : choisissez une case de votre territoire entreprise.`,
+      stillPending: true,
+    };
+  }
+  const cell = cellByKey.get(key);
+  if (!cell || cell.companyId !== p.companyId) {
+    state.pendingBoardSelection = null;
+    state.pendingManagement = null;
+    return { log: `${cfg.label} — Management : case invalide.`, stillPending: false };
+  }
+
+  for (let i = 0; i < mg.pawnsToPlace; i++) {
+    cell.prospectionPawns.push(p.companyId);
+  }
+
+  if (mg.buildSchool) {
+    state.pendingManagement = {
+      ...mg,
+      undoPawns: { key, count: mg.pawnsToPlace },
+    };
+    const schoolKeys = state.board.cells
+      .filter(c => c.companyId === p.companyId && !c.hasSchool)
+      .map(c => axialKey(c));
+    state.pendingBoardSelection = {
+      kind: 'management_school',
+      companyId: p.companyId,
+      validKeys: schoolKeys,
+      selectedKeys: [],
+      maxSelect: 1,
+      introHtml: buildManagementSchoolIntroHtml(cfg),
+    };
+    return { log: '', stillPending: true };
+  }
+
+  state.companies[p.companyId].treasury -= mg.totalCost;
+  state.pendingManagement = null;
+  state.pendingBoardSelection = null;
+  return {
+    log: `${cfg.label} — Management : ${mg.pawnsToPlace} pion(s) placé(s) (−${mg.totalCost}M).`,
+    stillPending: false,
+  };
+}
+
+function applyManagementSchool(
+  state: GameState,
+  p: PendingBoardSelection,
+  cfg: CompanyConfig,
+  cellByKey: Map<string, HexCell>,
+  valid: Set<string>,
+): ApplyBoardSelectionResult {
+  const mg = state.pendingManagement;
+  if (!mg || mg.companyId !== p.companyId) {
+    state.pendingBoardSelection = null;
+    state.pendingManagement = null;
+    return { log: `${cfg.label} — Management : erreur d'état.`, stillPending: false };
+  }
+
+  const key = p.selectedKeys[0];
+  if (!key || !valid.has(key)) {
+    return {
+      log: `${cfg.label} — Management : choisissez une case sans école.`, stillPending: true,
+    };
+  }
+  const cell = cellByKey.get(key);
+  if (!cell || cell.hasSchool) {
+    return {
+      log: `${cfg.label} — Management : case invalide pour l'école.`, stillPending: true,
+    };
+  }
+
+  cell.hasSchool = true;
+  state.companies[p.companyId].treasury -= mg.totalCost;
+  const parts: string[] = [];
+  if (mg.pawnsToPlace > 0) parts.push(`${mg.pawnsToPlace} pion(s)`);
+  if (mg.buildSchool) parts.push('1 école');
+  state.pendingManagement = null;
+  state.pendingBoardSelection = null;
+  return {
+    log: `${cfg.label} — Management : ${parts.join(', ')} (−${mg.totalCost}M).`,
+    stillPending: false,
+  };
+}
+
+/** Annule la sélection plateau et annule les pions Management en attente d’école si besoin. */
+export function abandonPendingBoardSelection(state: GameState): void {
+  const mg = state.pendingManagement;
+  if (mg?.undoPawns) {
+    const cellByKey = new Map(state.board.cells.map(c => [axialKey(c), c]));
+    const cell = cellByKey.get(mg.undoPawns.key);
+    const cid = mg.companyId;
+    if (cell) {
+      let n = mg.undoPawns.count;
+      while (n > 0) {
+        const idx = cell.prospectionPawns.lastIndexOf(cid);
+        if (idx < 0) break;
+        cell.prospectionPawns.splice(idx, 1);
+        n--;
+      }
+    }
+  }
+  state.pendingManagement = null;
+  state.pendingBoardSelection = null;
 }
 
 function buildProspectionIntroHtml(
@@ -85,6 +269,7 @@ function buildProspectionIntroHtml(
   <div class="prospection-guide-rules">
     <p class="prospection-guide-title">Comment se développer</p>
     <ul>
+      <li>Les hexagones <strong>verts</strong> sur la carte sont les cases que vous pouvez prendre. <strong>Cliquez</strong> pour les sélectionner ou les retirer (l’ordre des clics = ordre de conquête).</li>
       <li>Ne sont conquérables que les cases <strong>libres</strong>, <strong>désertiques</strong> ou en <strong>embargo</strong> (pas l’océan, pas l’hexagone réservé au siège d’un cluster entreprise).</li>
       <li>Chaque nouvelle case doit être <strong>adjacente</strong> (un des 6 hexagones voisins) à une case où vous avez déjà une <strong>part de marché</strong> ou un <strong>pion de prospection</strong>.</li>
       <li>Chaque case prise accueille un pion : vous ne pouvez pas dépasser le nombre de <strong>pions disponibles</strong> (${stats.prospectionPawns} sur le plateau).</li>
@@ -93,6 +278,47 @@ function buildProspectionIntroHtml(
   <div class="prospection-guide-stats">
     <p><strong>Ce tour :</strong> jusqu’à <span class="prospection-max">${maxConquer}</span> case(s) —
     ${targetsCount} case(s) neutre(s) touchant votre territoire, plafonné par vos ${stats.prospectionPawns} pion(s).</p>
+  </div>
+</div>`;
+}
+
+function buildConstructionIntroHtml(cfg: CompanyConfig, maxSelect: number, cost: number): string {
+  return `
+<div class="prospection-guide">
+  <p class="prospection-guide-lead"><strong style="color:${cfg.color}">${cfg.label}</strong> — placement d’usines.</p>
+  <div class="prospection-guide-rules">
+    <p class="prospection-guide-title">Construction</p>
+    <ul>
+      <li>Les hexagones <strong>verts</strong> sont les cases de votre <strong>territoire entreprise</strong> sans usine. <strong>Cliquez</strong> pour choisir où construire (${cost}M par usine).</li>
+      <li>Jusqu’à <strong>${maxSelect}</strong> usine(s) ce tour (trésorerie et plafond ${MAX_FACTORIES} usines). Recliquez sur une case pour la retirer.</li>
+    </ul>
+  </div>
+</div>`;
+}
+
+function buildManagementPawnsIntroHtml(cfg: CompanyConfig, pawns: number, schoolAfter: boolean): string {
+  return `
+<div class="prospection-guide">
+  <p class="prospection-guide-lead"><strong style="color:${cfg.color}">${cfg.label}</strong> — recrutement.</p>
+  <div class="prospection-guide-rules">
+    <p class="prospection-guide-title">Placement des pions</p>
+    <ul>
+      <li>Cliquez sur <strong>une case de votre territoire entreprise</strong> (hexagones verts) : les <strong>${pawns}</strong> nouveau(x) pion(s) y seront placés.</li>
+      ${schoolAfter ? '<li>Ensuite vous choisirez une case <strong>sans école</strong> pour l’école de management.</li>' : ''}
+    </ul>
+  </div>
+</div>`;
+}
+
+function buildManagementSchoolIntroHtml(cfg: CompanyConfig): string {
+  return `
+<div class="prospection-guide">
+  <p class="prospection-guide-lead"><strong style="color:${cfg.color}">${cfg.label}</strong> — école de management.</p>
+  <div class="prospection-guide-rules">
+    <p class="prospection-guide-title">Construction</p>
+    <ul>
+      <li>Cliquez sur une case de votre territoire <strong>sans école</strong> (hexagones verts) pour y construire l’école (${SCHOOL_COST}M).</li>
+    </ul>
   </div>
 </div>`;
 }
@@ -209,25 +435,53 @@ async function handleManagement(ctx: ActionContext): Promise<ActionResult> {
     return { log: `${cfg.label} — Management : fonds insuffisants.` };
   }
 
-  company.treasury -= totalCost;
+  if (totalCost === 0) {
+    return { log: `${cfg.label} — Management : aucune action.` };
+  }
 
   const companyCells = state.board.cells.filter(c => c.companyId === company.id);
-  for (let i = 0; i < pawns; i++) {
-    const target = companyCells.find(c => c.hasFactory || c.hasSchool) ?? companyCells[0];
-    if (target) target.prospectionPawns.push(company.id);
+  const territoryKeys = companyCells.map(c => axialKey(c));
+  const schoolKeys = companyCells.filter(c => !c.hasSchool).map(c => axialKey(c));
+
+  if (pawns > 0 && territoryKeys.length === 0) {
+    return { log: `${cfg.label} — Management : aucune case sur votre territoire.` };
+  }
+  if (pawns === 0 && buildSchool && schoolKeys.length === 0) {
+    return { log: `${cfg.label} — Management : aucune case libre pour une école.` };
   }
 
-  if (buildSchool) {
-    const schoolTarget = companyCells.find(c => !c.hasSchool);
-    if (schoolTarget) schoolTarget.hasSchool = true;
+  state.pendingManagement = {
+    companyId: company.id,
+    totalCost,
+    pawnsToPlace: pawns,
+    buildSchool,
+  };
+
+  if (pawns > 0) {
+    return {
+      log: '',
+      boardSelectionDeferred: {
+        kind: 'management_pawns',
+        companyId: company.id,
+        validKeys: territoryKeys,
+        selectedKeys: [],
+        maxSelect: 1,
+        introHtml: buildManagementPawnsIntroHtml(cfg, pawns, buildSchool),
+      },
+    };
   }
 
-  const parts: string[] = [];
-  if (pawns > 0) parts.push(`${pawns} pion(s) recruté(s)`);
-  if (buildSchool) parts.push('1 école construite');
-  const summary = parts.length > 0 ? parts.join(', ') : 'aucune action';
-
-  return { log: `${cfg.label} — Management : ${summary} (−${totalCost}M).` };
+  return {
+    log: '',
+    boardSelectionDeferred: {
+      kind: 'management_school',
+      companyId: company.id,
+      validKeys: schoolKeys,
+      selectedKeys: [],
+      maxSelect: 1,
+      introHtml: buildManagementSchoolIntroHtml(cfg),
+    },
+  };
 }
 
 // ─── Construction ───────────────────────────────────────────
@@ -236,61 +490,36 @@ async function handleConstruction(ctx: ActionContext): Promise<ActionResult> {
   const { company, stats, state } = ctx;
   const cfg = COMPANIES[company.id];
 
-  const canBuild = company.treasury >= FACTORY_COST && stats.factories < MAX_FACTORIES;
-  const maxFactories = Math.min(
+  const validKeys = state.board.cells
+    .filter(c => c.companyId === company.id && !c.hasFactory)
+    .map(c => axialKey(c));
+
+  const maxSelect = Math.min(
     Math.floor(company.treasury / FACTORY_COST),
     MAX_FACTORIES - stats.factories,
+    validKeys.length,
   );
 
-  const form = document.createElement('div');
-  form.innerHTML = `
-    <p style="margin-bottom:12px">Trésorerie : <strong>${company.treasury}M</strong> — Usines : ${stats.factories}/${MAX_FACTORIES}</p>
-    <div style="display:flex;align-items:center;gap:12px;">
-      <label>Usines à construire (${FACTORY_COST}M chacune) :</label>
-      <input type="number" id="build-count" min="0" max="${maxFactories}" value="${canBuild ? 1 : 0}"
-             style="width:60px;padding:6px;border-radius:6px;border:1px solid rgba(255,255,255,0.2);background:var(--bg-card);color:#fff;font-size:1rem;text-align:center;"
-             ${canBuild ? '' : 'disabled'}>
-    </div>
-    <p id="build-cost" style="margin-top:12px;font-weight:700;color:var(--gold);">Coût : ${canBuild ? FACTORY_COST : 0}M</p>
-  `;
-
-  form.querySelector('#build-count')!.addEventListener('input', () => {
-    const count = parseInt((form.querySelector('#build-count') as HTMLInputElement).value) || 0;
-    form.querySelector('#build-cost')!.textContent = `Coût : ${count * FACTORY_COST}M`;
-  });
-
-  const result = await ctx.modal.show({
-    title: `${cfg.label} — Construction`,
-    body: form,
-    buttons: [
-      { label: 'Annuler', value: 'cancel' },
-      { label: 'Construire', value: 'confirm', primary: true },
-    ],
-  });
-
-  if (result === 'cancel') {
-    return { log: `${cfg.label} — Construction : aucune action.` };
+  if (maxSelect <= 0 || validKeys.length === 0) {
+    return {
+      log: `${cfg.label} — Construction : impossible (trésorerie, plafond ${MAX_FACTORIES} usines, ou aucune case libre sur votre territoire).`,
+    };
   }
 
-  const count = parseInt((form.querySelector('#build-count') as HTMLInputElement).value) || 0;
-  const cost = count * FACTORY_COST;
+  const introHtml = buildConstructionIntroHtml(cfg, maxSelect, FACTORY_COST);
 
-  if (cost > company.treasury || count <= 0) {
-    return { log: `${cfg.label} — Construction : aucune usine construite.` };
-  }
-
-  company.treasury -= cost;
-
-  const companyCells = state.board.cells.filter(
-    c => c.companyId === company.id && !c.hasFactory,
-  );
-  let built = 0;
-  for (let i = 0; i < count && i < companyCells.length; i++) {
-    companyCells[i].hasFactory = true;
-    built++;
-  }
-
-  return { log: `${cfg.label} — Construction : ${built} usine(s) construite(s) (−${cost}M).` };
+  return {
+    log: '',
+    boardSelectionDeferred: {
+      kind: 'construction',
+      companyId: company.id,
+      validKeys,
+      selectedKeys: [],
+      maxSelect,
+      introHtml,
+      costPerFactory: FACTORY_COST,
+    },
+  };
 }
 
 // ─── Prospection ────────────────────────────────────────────
@@ -319,10 +548,12 @@ async function handleProspection(ctx: ActionContext): Promise<ActionResult> {
 
   return {
     log: '',
-    prospectionDeferred: {
+    boardSelectionDeferred: {
+      kind: 'prospection',
       companyId: company.id,
-      targetKeys: targets.map(t => axialKey(t)),
-      maxConquer: movesAvailable,
+      validKeys: targets.map(t => axialKey(t)),
+      selectedKeys: [],
+      maxSelect: movesAvailable,
       introHtml,
     },
   };
@@ -367,18 +598,24 @@ async function handleGuerreDesPrix(ctx: ActionContext): Promise<ActionResult> {
   const form = document.createElement('div');
   form.innerHTML = `
     <p>Votre force : <strong>${attackPower}</strong> (${stats.prospectionPawns} pions + ${stats.factories} usines)</p>
-    <p style="margin:8px 0;font-size:0.85rem;color:var(--text-muted)">Seules les cibles plus faibles peuvent être attaquées.</p>
+    <p style="margin:8px 0;font-size:0.85rem;color:var(--text-muted)">Les cases attaquables sont <strong style="color:#66BB6A">surlignées en vert</strong> sur la carte. Seules les cibles plus faibles peuvent être cochées.</p>
     <div style="max-height:200px;overflow-y:auto;margin-top:8px;">${listHtml}</div>
   `;
 
-  const result = await ctx.modal.show({
-    title: `${cfg.label} — Guerre des Prix`,
-    body: form,
-    buttons: [
-      { label: 'Annuler', value: 'cancel' },
-      { label: 'Attaquer', value: 'confirm', primary: true },
-    ],
-  });
+  ctx.highlightBoardKeys(contestable.map(c => axialKey(c)));
+  let result: string;
+  try {
+    result = await ctx.modal.show({
+      title: `${cfg.label} — Guerre des Prix`,
+      body: form,
+      buttons: [
+        { label: 'Annuler', value: 'cancel' },
+        { label: 'Attaquer', value: 'confirm', primary: true },
+      ],
+    });
+  } finally {
+    ctx.highlightBoardKeys(null);
+  }
 
   if (result === 'cancel') {
     return { log: `${cfg.label} — Guerre des Prix : aucune attaque.` };

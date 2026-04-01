@@ -14,9 +14,12 @@ const HEX_TYPE_COLORS: Record<string, string> = {
 export class BoardRenderer {
   private svg: SVGSVGElement;
   private group: SVGGElement;
+  private cellMap = new Map<string, HexCell>();
   private hexElements = new Map<string, SVGPolygonElement>();
   private iconGroups = new Map<string, SVGGElement>();
   private onHexClick: ((cell: HexCell) => void) | null = null;
+  private boardHighlightValid = new Set<string>();
+  private boardHighlightSelected: string[] = [];
 
 
   private panX = 0;
@@ -40,14 +43,27 @@ export class BoardRenderer {
     this.onHexClick = callback;
   }
 
+  /** Met en évidence les cases valides / sélectionnées (prospection, construction). */
+  setBoardHighlights(validKeys: string[], selectedKeys: string[]) {
+    this.boardHighlightValid = new Set(validKeys);
+    this.boardHighlightSelected = [...selectedKeys];
+    for (const [key, poly] of this.hexElements) {
+      poly.classList.toggle('hex-board-valid', this.boardHighlightValid.has(key));
+      poly.classList.toggle('hex-board-selected', this.boardHighlightSelected.includes(key));
+      const cell = this.cellMap.get(key);
+      if (cell) this.restoreHexStroke(key, cell, poly);
+    }
+  }
+
   render(layout: BoardLayout) {
     this.group.innerHTML = '';
     this.hexElements.clear();
     this.iconGroups.clear();
+    this.cellMap.clear();
+    this.setBoardHighlights([], []);
 
-    const cellMap = new Map<string, HexCell>();
     for (const cell of layout.cells) {
-      cellMap.set(axialKey(cell), cell);
+      this.cellMap.set(axialKey(cell), cell);
     }
 
     // Centrer le plateau
@@ -84,14 +100,24 @@ export class BoardRenderer {
       if (this.onHexClick) this.onHexClick(cell);
     });
 
+    const key = axialKey(cell);
     polygon.addEventListener('mouseenter', () => {
+      if (this.boardHighlightValid.size > 0) {
+        if (this.boardHighlightValid.has(key)) {
+          polygon.setAttribute('stroke-width', '3');
+          polygon.setAttribute(
+            'stroke',
+            this.boardHighlightSelected.includes(key) ? '#E65100' : '#43A047',
+          );
+        }
+        return;
+      }
       polygon.setAttribute('stroke-width', '3');
       polygon.setAttribute('stroke', '#FFD600');
     });
 
     polygon.addEventListener('mouseleave', () => {
-      polygon.setAttribute('stroke-width', '1.5');
-      polygon.setAttribute('stroke', this.getStrokeColor(cell));
+      this.restoreHexStroke(key, cell, polygon);
     });
 
     this.group.appendChild(polygon);
@@ -109,6 +135,19 @@ export class BoardRenderer {
       return COMPANIES[cell.companyId].color;
     }
     return HEX_TYPE_COLORS[cell.type] ?? '#F5F0E1';
+  }
+
+  private restoreHexStroke(key: string, cell: HexCell, polygon: SVGPolygonElement) {
+    polygon.setAttribute('stroke-width', '1.5');
+    if (this.boardHighlightSelected.includes(key)) {
+      polygon.setAttribute('stroke', '#EF6C00');
+      return;
+    }
+    if (this.boardHighlightValid.has(key)) {
+      polygon.setAttribute('stroke', '#2E7D32');
+      return;
+    }
+    polygon.setAttribute('stroke', this.getStrokeColor(cell));
   }
 
   private getStrokeColor(cell: HexCell): string {

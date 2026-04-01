@@ -3,7 +3,14 @@ import { createDefault4PlayerLayout } from '../board/defaultLayouts';
 import type { CompanyId, CompanyState, GameState, Player } from '../game/types';
 import { COMPANIES, COMPANY_PLAY_ORDER } from '../game/types';
 import { ACTION_LABELS } from '../game/RDE';
-import { executeAction, computeBoardStats, applyProspectionCount, clearPendingProspection } from '../game/actions';
+import {
+  executeAction,
+  computeBoardStats,
+  applyBoardSelection,
+  abandonPendingBoardSelection,
+  toggleBoardSelectionKey,
+} from '../game/actions';
+import { FACTORY_COST } from '../game/constants';
 import { ActionModal } from './ActionModal';
 import { RDEPanel } from './RDEPanel';
 import { CompanyPanel } from './CompanyPanel';
@@ -419,7 +426,8 @@ export class App {
       agentLibrePlayerId: 1,
       agentLibreUsedThisRound: false,
       lastActionLog: null,
-      pendingProspection: null,
+      pendingBoardSelection: null,
+      pendingManagement: null,
     };
 
     this.showGameScreen();
@@ -481,13 +489,13 @@ export class App {
     const currentCompanyState = state.companies[currentCompany];
 
     const isSelectPhase = state.turnPhase === 'select_rde';
-    const isProspectionPending = state.turnPhase === 'prospection_pending';
+    const isBoardSelectionPending = state.turnPhase === 'board_selection_pending';
     const isDone = state.turnPhase === 'done';
 
     const phaseLabel = isSelectPhase
       ? '<span class="phase-badge phase-select">Choisir une action RDE</span>'
-      : isProspectionPending
-        ? '<span class="phase-badge phase-prospection">Prospection</span>'
+      : isBoardSelectionPending
+        ? '<span class="phase-badge phase-prospection">Choix sur le plateau</span>'
         : isDone
           ? '<span class="phase-badge phase-done">Action résolue</span>'
           : '<span class="phase-badge phase-resolve">Résolution…</span>';
@@ -526,20 +534,19 @@ export class App {
         </div>
 
         <div class="game-footer glass">
-          ${state.pendingProspection ? `
-            <div class="prospection-panel" id="prospection-panel">
-              ${state.pendingProspection.introHtml}
-              <div class="prospection-actions">
-                <label for="prospection-count">Nombre de cases à conquérir (max ${state.pendingProspection.maxConquer}) :</label>
-                <input type="number" id="prospection-count" class="prospection-count-input" min="0"
-                  max="${state.pendingProspection.maxConquer}" value="${state.pendingProspection.maxConquer}" />
-                <button type="button" class="btn btn-primary" id="btn-prospection-ok">Valider</button>
-                <button type="button" class="btn btn-secondary" id="btn-prospection-cancel">Annuler</button>
+          ${state.pendingBoardSelection ? `
+            <div class="prospection-panel" id="board-selection-panel">
+              ${state.pendingBoardSelection.introHtml}
+              <div class="board-selection-meta" id="board-selection-meta">
+                ${this.getBoardSelectionMetaHtml(state)}
               </div>
-              <p class="prospection-order-hint">Ordre des cases : liste fixe du moteur (déterministe).</p>
+              <div class="prospection-actions">
+                <button type="button" class="btn btn-primary" id="btn-board-selection-ok">Valider</button>
+                <button type="button" class="btn btn-secondary" id="btn-board-selection-cancel">Annuler</button>
+              </div>
             </div>
           ` : ''}
-          ${state.lastActionLog && !state.pendingProspection ? `<div class="action-log">${state.lastActionLog}</div>` : ''}
+          ${state.lastActionLog ? `<div class="action-log">${state.lastActionLog}</div>` : ''}
           <button class="btn btn-primary" id="btn-next-turn" ${!isDone ? 'disabled' : ''}>Tour suivant →</button>
         </div>
       </div>
@@ -550,8 +557,20 @@ export class App {
     this.boardRenderer = new BoardRenderer(boardContainer);
     this.boardRenderer.render(state.board);
     this.boardRenderer.setOnHexClick((cell) => {
-      console.log('Hex cliqué:', axialKey(cell), cell);
+      const st = this.gameState;
+      if (!st || st.turnPhase !== 'board_selection_pending' || !st.pendingBoardSelection) return;
+      const key = axialKey(cell);
+      if (!toggleBoardSelectionKey(st, key)) return;
+      const p = st.pendingBoardSelection;
+      this.boardRenderer?.setBoardHighlights(p.validKeys, p.selectedKeys);
+      const meta = document.getElementById('board-selection-meta');
+      if (meta) meta.innerHTML = this.getBoardSelectionMetaHtml(st);
     });
+
+    if (state.pendingBoardSelection) {
+      const p = state.pendingBoardSelection;
+      this.boardRenderer.setBoardHighlights(p.validKeys, p.selectedKeys);
+    }
 
     // RDE Panel
     const rdeBar = document.getElementById('rde-bar')!;
@@ -608,12 +627,12 @@ export class App {
       this.showTitleScreen();
     });
 
-    if (state.pendingProspection) {
-      document.getElementById('btn-prospection-ok')!.addEventListener('click', () => {
-        this.confirmProspection();
+    if (state.pendingBoardSelection) {
+      document.getElementById('btn-board-selection-ok')!.addEventListener('click', () => {
+        this.confirmBoardSelection();
       });
-      document.getElementById('btn-prospection-cancel')!.addEventListener('click', () => {
-        this.cancelProspection();
+      document.getElementById('btn-board-selection-cancel')!.addEventListener('click', () => {
+        this.cancelBoardSelection();
       });
     }
 
@@ -636,11 +655,18 @@ export class App {
       company,
       stats,
       modal,
+      highlightBoardKeys: (keys) => {
+        if (!keys?.length) {
+          this.boardRenderer?.setBoardHighlights([], []);
+          return;
+        }
+        this.boardRenderer?.setBoardHighlights(keys, []);
+      },
     });
 
-    if (result.prospectionDeferred) {
-      state.pendingProspection = result.prospectionDeferred;
-      state.turnPhase = 'prospection_pending';
+    if (result.boardSelectionDeferred) {
+      state.pendingBoardSelection = result.boardSelectionDeferred;
+      state.turnPhase = 'board_selection_pending';
       state.lastActionLog = null;
       this.refreshGameScreen();
       return;
@@ -651,27 +677,58 @@ export class App {
     this.refreshGameScreen();
   }
 
-  private confirmProspection() {
-    if (!this.gameState?.pendingProspection) return;
-    const log = applyProspectionCount(this.gameState, this.getProspectionCountInput());
+  private getBoardSelectionMetaHtml(state: GameState): string {
+    const p = state.pendingBoardSelection;
+    if (!p) return '';
+    const n = p.selectedKeys.length;
+    const treasury = state.companies[p.companyId].treasury;
+    if (p.kind === 'construction') {
+      const unit = p.costPerFactory ?? FACTORY_COST;
+      const cost = n * unit;
+      return `<p class="board-selection-meta-line">Usines sélectionnées : <strong>${n}</strong> / ${p.maxSelect} — Coût : <strong>${cost}M</strong> (trésorerie ${treasury}M)</p>`;
+    }
+    if (p.kind === 'management_pawns' || p.kind === 'management_school') {
+      return `<p class="board-selection-meta-line">Case sélectionnée : <strong>${n >= 1 ? 'oui' : 'non'}</strong> / 1 — Coût prévu : <strong>${state.pendingManagement?.totalCost ?? 0}M</strong> (trésorerie ${treasury}M)</p>`;
+    }
+    return `<p class="board-selection-meta-line">Cases sélectionnées : <strong>${n}</strong> / ${p.maxSelect}</p>`;
+  }
+
+  private confirmBoardSelection() {
+    if (!this.gameState?.pendingBoardSelection) return;
+    const p = this.gameState.pendingBoardSelection;
+    if (p.maxSelect >= 1 && p.selectedKeys.length === 0) {
+      return;
+    }
+    const { log, stillPending } = applyBoardSelection(this.gameState);
+    if (stillPending) {
+      this.gameState.lastActionLog = log || null;
+      const next = this.gameState.pendingBoardSelection;
+      if (next) {
+        this.boardRenderer?.setBoardHighlights(next.validKeys, next.selectedKeys);
+      }
+      this.refreshGameScreen();
+      return;
+    }
     this.gameState.lastActionLog = log;
     this.gameState.turnPhase = 'done';
+    this.gameState.pendingBoardSelection = null;
+    this.boardRenderer?.setBoardHighlights([], []);
     this.refreshGameScreen();
   }
 
-  private cancelProspection() {
-    if (!this.gameState?.pendingProspection) return;
-    const companyId = this.gameState.pendingProspection.companyId;
-    clearPendingProspection(this.gameState);
-    this.gameState.lastActionLog = `${COMPANIES[companyId].label} — Prospection : annulée.`;
-    this.gameState.turnPhase = 'done';
+  private cancelBoardSelection() {
+    const gs = this.gameState;
+    const p = gs?.pendingBoardSelection;
+    if (!gs || !p) return;
+    abandonPendingBoardSelection(gs);
+    const actionLabel =
+      p.kind === 'construction' ? 'Construction'
+        : p.kind === 'management_pawns' || p.kind === 'management_school' ? 'Management'
+          : 'Prospection';
+    gs.lastActionLog = `${COMPANIES[p.companyId].label} — ${actionLabel} : annulée.`;
+    gs.turnPhase = 'done';
+    this.boardRenderer?.setBoardHighlights([], []);
     this.refreshGameScreen();
-  }
-
-  private getProspectionCountInput(): number {
-    const input = document.getElementById('prospection-count') as HTMLInputElement | null;
-    if (!input) return 0;
-    return parseInt(input.value, 10) || 0;
   }
 
   private refreshGameScreen() {
@@ -697,7 +754,8 @@ export class App {
     state.currentCompanyIndex = nextIndex;
     state.turnPhase = 'select_rde';
     state.lastActionLog = null;
-    state.pendingProspection = null;
+    state.pendingBoardSelection = null;
+    state.pendingManagement = null;
 
     const nextCompanyId = COMPANY_PLAY_ORDER[state.currentCompanyIndex];
     const nextPatronId = state.companies[nextCompanyId].patronPlayerId;

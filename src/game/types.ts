@@ -145,17 +145,35 @@ export interface MarketState {
 export type TurnPhase =
   | 'select_rde'
   | 'resolve_action'
-  | 'prospection_pending'
+  | 'board_selection_pending'
   | 'done';
 
-/** Saisie du nombre de cases à conquérir (pas de modale — UI dans le pied de page). */
-export interface PendingProspectionState {
+/** Sélection par clic sur le plateau (prospection / construction / management). */
+export interface PendingBoardSelection {
+  kind:
+    | 'prospection'
+    | 'construction'
+    | 'management_pawns'
+    | 'management_school';
   companyId: CompanyId;
-  /** Ordre de conquête (coordonnées axiales) */
-  targetKeys: string[];
-  /** min(pions sur le plateau, cases cibles) */
-  maxConquer: number;
+  /** Cases autorisées (clés axiales `"q,r"`). */
+  validKeys: string[];
+  /** Ordre = ordre des clics (prospection : ordre de conquête). */
+  selectedKeys: string[];
+  maxSelect: number;
   introHtml: string;
+  /** Construction : coût par usine (M). */
+  costPerFactory?: number;
+}
+
+/** Coût et placements en attente après validation modale Management (paiement au clic final). */
+export interface PendingManagementState {
+  companyId: CompanyId;
+  totalCost: number;
+  pawnsToPlace: number;
+  buildSchool: boolean;
+  /** Si sélection école annulée après placement des pions : retirer ces pions. */
+  undoPawns?: { key: string; count: number };
 }
 
 // ─── Etat global du jeu ─────────────────────────────────────
@@ -191,5 +209,7 @@ export interface GameState {
   agentLibrePlayerId: number;
   agentLibreUsedThisRound: boolean;
   lastActionLog: string | null;
-  pendingProspection: PendingProspectionState | null;
+  pendingBoardSelection: PendingBoardSelection | null;
+  /** Réservé à Management : payé uniquement après validation plateau. */
+  pendingManagement: PendingManagementState | null;
 }
